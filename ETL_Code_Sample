@@ -1,16 +1,84 @@
-import openpyxl as xl
-import pandas as pd
+from abc import ABC, abstractmethod
+from Objects.Universal.database import Universal
 import re
-import sqlalchemy as db
+import pandas as pd
+import openpyxl as xl
+from openpyxl.workbook.workbook import Workbook, Worksheet
 
-pd.options.display.max_rows = 500
-pd.options.display.max_columns = 100
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Base Classes
+# ----------------------------------------------------------------------------------------------------------------------
+class FromFile(ABC):
+
+    def __init__(self,
+                 file_path: str):
+        self.path = file_path
+
+    @property
+    @abstractmethod
+    def columns(self):
+        return dict()
+
+    @abstractmethod
+    def get_dataframe(self):
+        pass
 
 
-class StateFIPS:
+class FromWorksheet(FromFile, ABC):
+
+    def __init__(self,
+                 file_path: str):
+        super().__init__(file_path=file_path)
+        self._workbook: Workbook = None
+        self._worksheet: Worksheet = None
+        self._activate_worksheet()
+
+    def _activate_worksheet(self):
+        self._workbook = xl.load_workbook(filename=self.path)
+        self._worksheet = self._workbook.worksheets[0]
+
+    @property
+    @abstractmethod
+    def header_row(self):
+        pass
+
+    @property
+    @abstractmethod
+    def last_column(self):
+        pass
+
+    def get_columns_from_worksheet(self):
+        columns = list(next(self._worksheet.iter_rows(min_row=self.header_row,
+                                                      max_col=self.last_column,
+                                                      values_only=True)))
+        columns = [self.columns.get(column) for column in columns]
+        return columns
+
+    def get_dataframe(self):
+        return pd.DataFrame(data=list(self._worksheet.iter_rows(min_row=self.header_row + 1,
+                                                                max_col=self.last_column,
+                                                                values_only=True)),
+                            columns=self.get_columns_from_worksheet())
+
+
+class FromCSV(FromFile, ABC):
+
+    @property
+    def columns(self):
+        return super().columns
+
+    def get_dataframe(self):
+        return pd.read_csv(self.path)
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# File Objects
+# ----------------------------------------------------------------------------------------------------------------------
+class StateFIPS(FromWorksheet):
 
     def __init__(self):
-        self.path = r'Geography/state-geocodes-v2016.xlsx'
+        super().__init__(file_path=r'Objects/Universal/Geography_Tables/_Files/state-geocodes-v2016.xlsx')
 
     @property
     def columns(self):
@@ -19,21 +87,19 @@ class StateFIPS:
                 'State (FIPS)': 'State_Code_FIPS',
                 'Name': 'Name'}
 
-    def get_dataframe(self):
-        wrkbk = xl.load_workbook(filename=self.path)
-        wrksht = wrkbk.worksheets[0]
-        columns = list(next(wrksht.iter_rows(min_row=6, max_col=4, values_only=True)))
-        print(columns)
-        columns = [self.columns.get(column) for column in columns]
-        print(columns)
-        return pd.DataFrame(data=[row for row in wrksht.iter_rows(min_row=7, max_col=4, values_only=True)],
-                            columns=columns)
+    @property
+    def header_row(self):
+        return 6
+
+    @property
+    def last_column(self):
+        return 4
 
 
-class AllOtherFIPS:
+class AllOtherFIPS(FromWorksheet):
 
     def __init__(self):
-        self.path = r'Geography/all-geocodes-v2016.xlsx'
+        super().__init__(file_path=r'Objects/Universal/Geography_Tables/_Files/all-geocodes-v2016.xlsx')
 
     @property
     def columns(self):
@@ -45,27 +111,42 @@ class AllOtherFIPS:
                 'Consolidtated City Code (FIPS)': 'Consolidated_City_Code_FIPS',
                 'Area Name (including legal/statistical area description)': 'Area_Name'}
 
-    def get_dataframe(self):
-        wrkbk = xl.load_workbook(filename=self.path)
-        wrksht = wrkbk.worksheets[0]
-        columns = list(next(wrksht.iter_rows(min_row=5, max_col=7, values_only=True)))
-        print(columns)
-        columns = [self.columns.get(column) for column in columns]
-        print(columns)
-        return pd.DataFrame(data=[row for row in wrksht.iter_rows(min_row=6, max_col=7, values_only=True)],
-                            columns=columns)
+    @property
+    def header_row(self):
+        return 5
+
+    @property
+    def last_column(self):
+        return 7
 
 
-class StateNamesAndAbbreviations:
+class StateNamesAndAbbreviations(FromCSV):
 
     def __init__(self):
-        self.path = r'Geography/states.csv'
+        super().__init__(file_path=r'Objects/Universal/Geography_Tables/_Files/states.csv')
 
-    def get_dataframe(self):
-        return pd.read_csv(self.path)
 
-def main():
+# ----------------------------------------------------------------------------------------------------------------------
+# Upload-able Datasets
+# ----------------------------------------------------------------------------------------------------------------------
+class FIPSDataset:
 
+    def get_dataset(self):
+        df = StateFIPS().get_dataframe()
+        df = df.merge(StateNamesAndAbbreviations().get_dataframe(),
+                      how='left',
+                      left_on='Name',
+                      right_on='State')
+        df = df.merge(AllOtherFIPS().get_dataframe(),
+                      how='left',
+                      left_on='State_Code_FIPS',
+                      right_on='State_Code_FIPS')
+
+        df['Area_Type'] = df['Area_Name'].apply(func=self.get_area_type)
+        df['Area_Name'] = df['Area_Name'].apply(func=self.clean_area_name)
+        return df
+
+    @staticmethod
     def get_area_type(value: str):
         try:
             value = re.search(pattern=r'(( [a-z]+)+?| Census Area| UT| CDP)$', string=value).group()
@@ -76,36 +157,22 @@ def main():
         except AttributeError:
             return pd.np.nan
 
+    @staticmethod
     def clean_area_name(value: str):
         return re.sub(pattern=r'(( [a-z]+)+?| Census Area| UT| CDP)$', repl='', string=value).strip()
 
-    state_fips = StateFIPS()
-    all_other_fips = AllOtherFIPS()
-    names_and_abbrevs = StateNamesAndAbbreviations()
+    def upload_dataset(self):
+        db = Universal()
+        db.execute_statement("DELETE FROM Stage.Geography_AreaType;")
+        df = self.get_dataset()
+        print(df.columns)
+        for index, row in df.iterrows():
+            db.execute_statement(statement='INSERT INTO {schema}.{table} () VALUES ();'.format(schema='Geography',
+                                                                                               table='FIPS_Data'))
 
-    df = state_fips.get_dataframe()
-    df = df.merge(
-        names_and_abbrevs.get_dataframe(),
-        how='left',
-        left_on='Name',
-        right_on='State')
-    df = df.merge(
-        all_other_fips.get_dataframe(),
-        how='left',
-        left_on='State_Code_FIPS',
-        right_on='State_Code_FIPS')
 
-    df['Area_Type'] = df['Area_Name'].apply(func=get_area_type)
-    df['Area_Name'] = df['Area_Name'].apply(func=clean_area_name)
-
-    db_engine = db.create_engine('mysql+pymysql://user:password@localhost')
-    db_engine.execute('DROP TABLE IF EXISTS Geography.Geography_Data;')
-
-    df.to_sql(name='Geography_Data',
-              con=db_engine,
-              schema='Stage_Financial',
-              if_exists='append',
-              index=True)
+def main():
+    FIPSDataset().upload_dataset()
 
 
 if __name__ == '__main__':
