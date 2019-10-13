@@ -1,0 +1,112 @@
+import openpyxl as xl
+import pandas as pd
+import re
+import sqlalchemy as db
+
+pd.options.display.max_rows = 500
+pd.options.display.max_columns = 100
+
+
+class StateFIPS:
+
+    def __init__(self):
+        self.path = r'Geography/state-geocodes-v2016.xlsx'
+
+    @property
+    def columns(self):
+        return {'Region': 'Region_ID',
+                'Division': 'Division_ID',
+                'State (FIPS)': 'State_Code_FIPS',
+                'Name': 'Name'}
+
+    def get_dataframe(self):
+        wrkbk = xl.load_workbook(filename=self.path)
+        wrksht = wrkbk.worksheets[0]
+        columns = list(next(wrksht.iter_rows(min_row=6, max_col=4, values_only=True)))
+        print(columns)
+        columns = [self.columns.get(column) for column in columns]
+        print(columns)
+        return pd.DataFrame(data=[row for row in wrksht.iter_rows(min_row=7, max_col=4, values_only=True)],
+                            columns=columns)
+
+
+class AllOtherFIPS:
+
+    def __init__(self):
+        self.path = r'Geography/all-geocodes-v2016.xlsx'
+
+    @property
+    def columns(self):
+        return {'Summary Level': 'Summary_Level',
+                'State Code (FIPS)': 'State_Code_FIPS',
+                'County Code (FIPS)': 'County_Code_FIPS',
+                'County Subdivision Code (FIPS)': 'County_Subdivision_Code_FIPS',
+                'Place Code (FIPS)': 'Place_Code_FIPS',
+                'Consolidtated City Code (FIPS)': 'Consolidated_City_Code_FIPS',
+                'Area Name (including legal/statistical area description)': 'Area_Name'}
+
+    def get_dataframe(self):
+        wrkbk = xl.load_workbook(filename=self.path)
+        wrksht = wrkbk.worksheets[0]
+        columns = list(next(wrksht.iter_rows(min_row=5, max_col=7, values_only=True)))
+        print(columns)
+        columns = [self.columns.get(column) for column in columns]
+        print(columns)
+        return pd.DataFrame(data=[row for row in wrksht.iter_rows(min_row=6, max_col=7, values_only=True)],
+                            columns=columns)
+
+
+class StateNamesAndAbbreviations:
+
+    def __init__(self):
+        self.path = r'Geography/states.csv'
+
+    def get_dataframe(self):
+        return pd.read_csv(self.path)
+
+def main():
+
+    def get_area_type(value: str):
+        try:
+            value = re.search(pattern=r'(( [a-z]+)+?| Census Area| UT| CDP)$', string=value).group()
+            value = value. \
+                replace('CDP', 'Census Designated Place'). \
+                replace('UT', 'Unorganized Territory')
+            return value.title()
+        except AttributeError:
+            return pd.np.nan
+
+    def clean_area_name(value: str):
+        return re.sub(pattern=r'(( [a-z]+)+?| Census Area| UT| CDP)$', repl='', string=value).strip()
+
+    state_fips = StateFIPS()
+    all_other_fips = AllOtherFIPS()
+    names_and_abbrevs = StateNamesAndAbbreviations()
+
+    df = state_fips.get_dataframe()
+    df = df.merge(
+        names_and_abbrevs.get_dataframe(),
+        how='left',
+        left_on='Name',
+        right_on='State')
+    df = df.merge(
+        all_other_fips.get_dataframe(),
+        how='left',
+        left_on='State_Code_FIPS',
+        right_on='State_Code_FIPS')
+
+    df['Area_Type'] = df['Area_Name'].apply(func=get_area_type)
+    df['Area_Name'] = df['Area_Name'].apply(func=clean_area_name)
+
+    db_engine = db.create_engine('mysql+pymysql://user:password@localhost')
+    db_engine.execute('DROP TABLE IF EXISTS Geography.Geography_Data;')
+
+    df.to_sql(name='Geography_Data',
+              con=db_engine,
+              schema='Stage_Financial',
+              if_exists='append',
+              index=True)
+
+
+if __name__ == '__main__':
+    main()
